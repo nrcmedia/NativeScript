@@ -9,6 +9,9 @@ export const unsetValue: any = new Object();
 
 let symbolPropertyMap = {};
 let cssSymbolPropertyMap = {};
+
+let cssSymbolResetMap = {};
+
 let inheritableProperties = new Array<InheritedProperty<any, any>>();
 let inheritableCssProperties = new Array<InheritedCssProperty<any, any>>();
 
@@ -35,7 +38,8 @@ const enum ValueSource {
     Default = 0,
     Inherited = 1,
     Css = 2,
-    Local = 3
+    Local = 3,
+    Keyframe = 4
 }
 
 export class Property<T extends ViewBase, U> implements TypedPropertyDescriptor<U>, definitions.Property<T, U> {
@@ -359,7 +363,7 @@ export class CssProperty<T extends Style, U> implements definitions.CssProperty<
         const name = options.name;
         this.name = name;
 
-        this.cssName = `css-${options.cssName}`;
+        this.cssName = `css:${options.cssName}`;
         this.cssLocalName = options.cssName;
 
         const key = Symbol(name + ":propertyKey");
@@ -541,6 +545,119 @@ export class CssProperty<T extends Style, U> implements definitions.CssProperty<
     }
 }
 
+interface CssAnimationPropertyOptions<T, U> {
+    readonly name: string;
+    readonly cssName?: string;
+    readonly inherited?: boolean;
+    readonly defaultValue?: U;
+    readonly affectsLayout?: boolean;
+    readonly equalityComparer?: (x: U, y: U) => boolean;
+    readonly valueChanged?: (target: T, oldValue: U, newValue: U) => void;
+    readonly valueConverter?: (value: string) => U;
+}
+
+export class CssAnimationProperty<T extends Style, U> {
+    public readonly name: string;
+    public readonly cssName: string;
+
+    public readonly native: symbol;
+    public readonly register: (cls: { prototype }) => void;
+
+    public readonly keyframe: string;
+    public readonly defaultValueKey: symbol;
+
+    constructor(private options: CssAnimationPropertyOptions<T, U>) {
+        const { inherited, valueConverter, equalityComparer, valueChanged, affectsLayout } = options;
+        const propertyName = options.name;
+        this.name = propertyName;
+        this.cssName = (options.cssName || propertyName);
+
+        const cssName = "css:" + (options.cssName || propertyName);
+        const keyframeName = "keyframe:" + propertyName;
+        this.keyframe = keyframeName;
+        const defaultName = "default:" + propertyName;
+
+        const defaultValueKey = Symbol(defaultName);
+        this.defaultValueKey = defaultValueKey;
+
+        const cssValue = Symbol(cssName);
+        const styleValue = Symbol(propertyName);
+        const keyframeValue = Symbol(keyframeName);
+        const computedValue = Symbol("computed-value:" + propertyName);
+        const computedSource = Symbol("computed-source:" + propertyName);
+
+        const native = this.native = Symbol("native:" + propertyName);
+        const eventName = propertyName + "Change";
+
+        function descriptor(symbol: symbol, propertySource: ValueSource, enumerable: boolean, configurable: boolean, getsComputed: boolean): PropertyDescriptor {
+            return { enumerable, configurable,
+                get: getsComputed ? function(this: T) { return this[computedValue]; } : function(this: T) { return this[symbol]; },
+                set(this: T, value: U) {
+                    let prev = this[computedValue];
+                    if (value === unsetValue) {
+                        this[symbol] = unsetValue;
+                        if (this[computedSource] >= propertySource) {
+                            if (this[styleValue] !== unsetValue) {
+                                this[computedSource] = ValueSource.Local;
+                                this[computedValue] = this[styleValue];
+                            } else if (this[cssValue] !== unsetValue) {
+                                this[computedSource] = ValueSource.Css;
+                                this[computedValue] = this[cssValue];
+                                // TODO: else if inherited, get from parent
+                            } else {
+                                delete this[computedSource];
+                                delete this[computedValue];
+                            }
+                        }
+                    } else {
+                        if (valueConverter && typeof value === "string") {
+                            value = valueConverter(value);
+                        }
+                        this[symbol] = value;
+                        if (this[computedSource] <= propertySource) {
+                            this[computedSource] = propertySource;
+                            this[computedValue] = value;
+                            // TODO: If this is inherited, notify children
+                        }
+                    }
+                    let next = this[computedValue];
+                    if (prev !== next && (!equalityComparer || !equalityComparer(prev, next))) {
+                        valueChanged && valueChanged(this, prev, next);
+                        this.view.nativeView && (this.view[native] = next);
+                        this.hasListeners(eventName) && this.notify({ eventName, object: this, propertyName, value });
+                        affectsLayout && this.view.requestLayout();
+                    }
+                }
+            }
+        }
+
+        const defaultPropertyDescriptor = descriptor(defaultValueKey, ValueSource.Default, false, false, false);
+        const cssPropertyDescriptor = descriptor(cssValue, ValueSource.Css, false, false, false);
+        const stylePropertyDescriptor = descriptor(styleValue, ValueSource.Local, true, true, true);
+        const keyframePropertyDescriptor = descriptor(keyframeValue, ValueSource.Keyframe, false, false, false);
+
+        cssSymbolResetMap[cssValue] = cssName;
+        cssSymbolResetMap[keyframeValue] = keyframeName;
+
+        symbolPropertyMap[computedValue] = this;
+
+        this.register = (cls: { prototype: T }) => {
+            cls.prototype[defaultValueKey] = options.defaultValue;
+            cls.prototype[computedValue] = options.defaultValue;
+            cls.prototype[computedSource] = ValueSource.Default;
+
+            cls.prototype[cssValue] = unsetValue;
+            cls.prototype[styleValue] = unsetValue;
+            cls.prototype[keyframeValue] = unsetValue;
+
+            Object.defineProperty(cls.prototype, defaultName, defaultPropertyDescriptor);
+            Object.defineProperty(cls.prototype, cssName, cssPropertyDescriptor);
+            Object.defineProperty(cls.prototype, propertyName, stylePropertyDescriptor);
+            Object.defineProperty(cls.prototype, keyframeName, keyframePropertyDescriptor);
+        }
+    }
+}
+
 export class InheritedCssProperty<T extends Style, U> extends CssProperty<T, U> implements definitions.InheritedCssProperty<T, U> {
     public setInheritedValue: (value: U) => void;
 
@@ -690,7 +807,7 @@ export class ShorthandProperty<T extends Style, P> implements definitions.Shorth
         const key = Symbol(this.name + ":propertyKey");
         this.key = key;
 
-        this.cssName = `css-${options.cssName}`;
+        this.cssName = `css:${options.cssName}`;
         this.cssLocalName = `${options.cssName}`;
 
         const converter = options.converter;
@@ -872,12 +989,12 @@ export function clearInheritedProperties(view: ViewBase): void {
 export function resetCSSProperties(style: Style): void {
     let symbols = (<any>Object).getOwnPropertySymbols(style);
     for (let symbol of symbols) {
-        const cssProperty = cssSymbolPropertyMap[symbol];
-        if (!cssProperty) {
-            continue;
+        let cssProperty;
+        if (cssProperty = cssSymbolPropertyMap[symbol]) {
+            style[cssProperty.cssName] = unsetValue;
+        } else if (cssProperty = cssSymbolResetMap[symbol]) {
+            style[cssProperty] = unsetValue;
         }
-
-        style[cssProperty.cssName] = unsetValue;
     }
 }
 
